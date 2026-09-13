@@ -1,0 +1,27 @@
+{
+  "name": "resumable-stream-engine",
+  "version": "1.0.0",
+  "description": "High-performance, memory-bounded resumable file streaming engine with backpressure control",
+  "type": "module",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "node --watch src/app.js",
+    "test": "node --test test/*.test.js",
+    "benchmark": "node benchmark/run-benchmark.js",
+    "simulate:drop": "node benchmark/drop-simulator.js"
+  },
+  "keywords": [
+    "stream",
+    "backpressure",
+    "resumable-upload",
+    "rfc7233",
+    "posix",
+    "zero-memory"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "pg": "^8.13.3"
+  }
+}
