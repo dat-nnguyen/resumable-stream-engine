@@ -1,4 +1,5 @@
-// Atomic session persistence and offset updates
+"use strict";
+
 import { query, withTransaction } from './client.js';
 
 export async function createSession({ id, filename, totalBytes }) {
