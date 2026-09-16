@@ -1,258 +1,203 @@
-# Resumable File Streaming Engine with Backpressure
+# Resumable Stream Engine
 
-[![Node.js](https://img.shields.io/badge/Node.js-v18%2B%20%7C%20ESM-green)](https://nodejs.org/)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-blue)](https://www.postgresql.org/)
-[![RFC 7233](https://img.shields.io/badge/HTTP-RFC%207233%20Compliant-orange)](https://datatracker.ietf.org/doc/html/rfc7233)
-[![License](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
-
-A high-performance, memory-bounded streaming engine built in Node.js designed to handle multi-gigabyte file uploads and downloads (10GB+) over HTTP without Out-Of-Memory (OOM) crashes.
+A Node.js HTTP service for uploading and downloading large files in chunks without running out of memory.
 
 ---
 
-## Key Highlights & Systems Architecture
+## Problems This Project Solves
 
-- **Bounded Memory Invariant**: Consistently operates with `< 25MB` V8 Heap allocations regardless of multi-gigabyte upload sizes, enforced via Node.js stream backpressure and configurable `highWaterMark` windows.
-- **Sparse File Allocation (O(1) in < 1ms)**: Pre-allocates target file space using POSIX `truncate` immediately upon session creation, eliminating runtime disk fragmentation and avoiding zero-filling latency (ADR-0002).
-- **POSIX `pwrite` Offset Writing**: Bypasses sequential write pointers and concurrent race conditions by writing chunks directly to disk at designated byte coordinates (`FileHandle.write(chunk, 0, len, offset)`) (ADR-0004).
-- **Zero-Memory Cryptographic Hasher**: Incremental SHA-256 `Transform` stream computes running checksums on-the-fly without accumulating buffers in memory, preventing downstream buffer pollution (ADR-0003).
-- **Crash Durability & Atomic Resumption**: Disk flushes via POSIX `fdatasync` (`FileHandle.sync()`) paired with atomic PostgreSQL transactions guarantee that committed byte offsets always match physical disk state (ADR-0005).
-- **RFC 7233 Protocol Conformance**: Standard HTTP `Content-Range` chunked `PATCH` uploads, `HEAD` offset probe discovery, and `Range` multi-part download streaming.
-- **Active Lifecycle Management**: Native `AbortController` integration cleans up sockets, tears down stream pipelines, releases file descriptors, and marks sessions `PAUSED` upon network disconnections (ADR-0006).
+1. **Out-of-Memory (OOM) crashes**: Loading large files (e.g. 5GB+) into memory buffers before writing to disk exhausts Node.js RAM. This project uses Node.js streams with backpressure to keep memory usage bounded (under 25MB V8 heap) regardless of file size.
+2. **Failed uploads starting over from scratch**: If a network connection drops at 95%, standard uploads force the client to restart from 0%. This project allows clients to query the server's current byte offset and resume uploading from where the connection was lost.
+3. **Data corruption during retries**: If a chunk is resent or arrives out of order, appending blindly corrupts the file. This project writes each chunk to disk at an exact byte offset using file handles (`pwrite`) and validates chunk order in PostgreSQL.
 
 ---
 
-## Architectural Data Flow
+## What It Is Used For
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Client as Client / Worker
-    participant Router as HTTP Server (node:http)
-    participant Hasher as HashTransformStream
-    participant Writer as OffsetWriterStream
-    participant Disk as File System (POSIX pwrite)
-    participant DB as PostgreSQL (pg.Pool)
-
-    Note over Client,DB: 1. Session Initialization
-    Client->>Router: POST /api/uploads { filename, totalBytes }
-    Router->>Disk: fs.open() + truncate(totalBytes) [Sparse File]
-    Router->>DB: INSERT INTO upload_sessions (status='INITIALIZED')
-    Router-->>Client: 201 Created (Location: /api/uploads/:id)
-
-    Note over Client,DB: 2. Chunk Streaming with Backpressure
-    Client->>Router: PATCH /api/uploads/:id [Content-Range: bytes 0-8388607/67108864]
-    Router->>DB: Check committed uploaded_bytes (Gap & Idempotency guard)
-    Router->>Hasher: Pipe incoming socket stream
-    Hasher->>Writer: Pipe chunk buffers (Backpressured at highWaterMark)
-    Writer->>Disk: pwrite(chunk, 0, len, offset)
-    
-    Note over Writer,Disk: 3. Crash Durability & Atomic Commit
-    Writer->>Disk: fdatasync() on chunk finish
-    Router->>DB: BEGIN TX -> INSERT chunk_logs -> UPDATE uploaded_bytes -> COMMIT
-    Router-->>Client: 206 Partial Content (Range: bytes=0-8388608)
-
-    Note over Client,DB: 4. Probing Resumption Offset (After Disconnect)
-    Client->>Router: HEAD /api/uploads/:id
-    Router->>DB: SELECT uploaded_bytes, status FROM upload_sessions
-    Router-->>Client: 200 OK (Range: bytes=0-8388608, X-Upload-Status: PAUSED)
-```
+- Uploading large assets (video files, disk images, backups, database dumps) over HTTP.
+- Applications with users on unstable or mobile connections where connection drops are common.
+- Services that need to accept large files on low-memory servers (e.g., small containers or VMs).
 
 ---
 
-## Protocol Specification (RFC 7233)
+## Quick Demo (curl)
 
-### 1. Initialize Upload Session
-- **Endpoint**: `POST /api/uploads`
-- **Request Body**:
-  ```json
-  {
-    "filename": "firmware-archive.tar.gz",
-    "totalBytes": 1073741824
-  }
-  ```
-- **Response**: `201 Created`
-  - `Location`: `/api/uploads/7f940b54-f5a6-42d4-a1db-f21503ba6930`
-  ```json
-  {
-    "id": "7f940b54-f5a6-42d4-a1db-f21503ba6930",
-    "filename": "firmware-archive.tar.gz",
-    "totalBytes": 1073741824,
-    "uploadedBytes": 0,
-    "status": "INITIALIZED",
-    "createdAt": "2026-09-16T02:00:00.000Z"
-  }
-  ```
+### 1. Initialize an upload session
 
-### 2. Upload Chunk
-- **Endpoint**: `PATCH /api/uploads/:id`
-- **Headers**:
-  - `Content-Type`: `application/octet-stream`
-  - `Content-Range`: `bytes 0-8388607/1073741824`
-  - `X-Chunk-SHA256`: `<hex-digest>` *(optional, verified on-the-fly)*
-- **Response (Partial)**: `206 Partial Content`
-  - `Range`: `bytes=0-8388608`
-  ```json
-  {
-    "status": "UPLOADING",
-    "uploadedBytes": 8388608,
-    "totalBytes": 1073741824,
-    "chunkBytesWritten": 8388608
-  }
-  ```
-- **Response (Completion)**: `200 OK`
-  ```json
-  {
-    "status": "COMPLETED",
-    "uploadedBytes": 1073741824,
-    "totalBytes": 1073741824,
-    "finalSha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a"
-  }
-  ```
-
-### 3. Probe Resumption State
-- **Endpoint**: `HEAD /api/uploads/:id`
-- **Response**: `200 OK`
-  - `Range`: `bytes=0-8388608`
-  - `X-Upload-Status`: `UPLOADING` | `PAUSED` | `COMPLETED`
-  - `X-Uploaded-Bytes`: `8388608`
-  - `X-Total-Bytes`: `1073741824`
-  - `Accept-Ranges`: `bytes`
-
-### 4. Download File with Range Support
-- **Endpoint**: `GET /api/downloads/:id`
-- **Headers**:
-  - `Range`: `bytes=0-1048575` *(first 1MB)*, `bytes=1048576-` *(from 1MB to EOF)*, or `bytes=-524288` *(last 512KB)*
-- **Response**: `206 Partial Content` (or `200 OK` for entire file)
-  - `Content-Range`: `bytes 0-1048575/1073741824`
-  - `Accept-Ranges`: `bytes`
-  - `Content-Length`: `1048576`
-
-### 5. Abort Session & Delete Storage
-- **Endpoint**: `DELETE /api/uploads/:id`
-- **Response**: `204 No Content` (removes sparse binary file and updates DB to `ABORTED`)
-
----
-
-## Performance & Memory Benchmarks
-
-The benchmark suite (`npm run benchmark`) stresses the engine with multi-megabyte payloads through `VirtualDataStream` while sampling V8 Heap and RSS usage every 25ms.
-
-```text
-===========================================================================
- RESUMABLE STREAMING ENGINE: PERFORMANCE & MEMORY BENCHMARK
-===========================================================================
-Payload Size:        64 MB (67,108,864 bytes)
-Chunk Window:        8 MB (8 chunks)
-Buffer HighWaterMark: 64 KB
-Baseline RSS:        57.65 MB
-Baseline HeapUsed:   9.56 MB
----------------------------------------------------------------------------
-Upload Throughput:   44.24 MB/s - 61.0 MB/s
-Download Throughput: 301.69 MB/s
-Peak V8 HeapUsed:    12.54 MB (Delta: +2.98 MB)
-Peak Process RSS:    104.98 MB
----------------------------------------------------------------------------
-Memory Boundedness:  PASS (V8 Heap strictly bounded < 25MB during 64MB streaming)
-Zero Heap Bloat:     PASS (Stream backpressure controls buffer queues)
-===========================================================================
-```
-
-### Chaos Drop Simulation
-
-Run mid-stream network drops simulating real-world packet drops, mobile cell switches, and wifi disconnections:
 ```bash
-npm run simulate:drop
+curl -X POST http://localhost:3000/api/uploads \
+  -H "Content-Type: application/json" \
+  -d '{"filename": "archive.zip", "totalBytes": 1000}'
 ```
-- Client drops socket midway through a chunk stream (`ECONNRESET`).
-- Engine aborts pipeline via `AbortController`, executes `FileHandle.close()`, and marks session `PAUSED`.
-- Client probes offset via `HEAD /api/uploads/:id`, retrieves last committed offset, and resumes.
-- Downloaded file is verified byte-for-byte with 100% SHA-256 accuracy.
+
+**Response (`201 Created`):**
+```json
+{
+  "id": "c1a2b3c4-d5e6-7890-abcd-ef1234567890",
+  "filename": "archive.zip",
+  "totalBytes": 1000,
+  "uploadedBytes": 0,
+  "status": "INITIALIZED"
+}
+```
+
+### 2. Upload the first chunk (bytes 0 to 499)
+
+```bash
+curl -X PATCH http://localhost:3000/api/uploads/c1a2b3c4-d5e6-7890-abcd-ef1234567890 \
+  -H "Content-Type: application/octet-stream" \
+  -H "Content-Range: bytes 0-499/1000" \
+  --data-binary @chunk1.bin
+```
+
+**Response (`206 Partial Content`):**
+```json
+{
+  "status": "UPLOADING",
+  "uploadedBytes": 500,
+  "totalBytes": 1000,
+  "chunkBytesWritten": 500
+}
+```
+
+### 3. Connection dropped? Probe where to resume
+
+Send a `HEAD` request to find out how many bytes the server has saved:
+
+```bash
+curl -I http://localhost:3000/api/uploads/c1a2b3c4-d5e6-7890-abcd-ef1234567890
+```
+
+**Response Headers:**
+```http
+HTTP/1.1 200 OK
+Range: bytes=0-500
+X-Upload-Status: UPLOADING
+X-Uploaded-Bytes: 500
+X-Total-Bytes: 1000
+```
+
+### 4. Resume upload with the next chunk (bytes 500 to 999)
+
+```bash
+curl -X PATCH http://localhost:3000/api/uploads/c1a2b3c4-d5e6-7890-abcd-ef1234567890 \
+  -H "Content-Type: application/octet-stream" \
+  -H "Content-Range: bytes 500-999/1000" \
+  --data-binary @chunk2.bin
+```
+
+**Response (`200 OK` - Upload complete):**
+```json
+{
+  "status": "COMPLETED",
+  "uploadedBytes": 1000,
+  "totalBytes": 1000,
+  "finalSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}
+```
+
+### 5. Download the file (full or range)
+
+```bash
+# Download the whole file
+curl -O http://localhost:3000/api/downloads/c1a2b3c4-d5e6-7890-abcd-ef1234567890
+
+# Or download a specific byte slice (RFC 7233)
+curl -H "Range: bytes=0-499" http://localhost:3000/api/downloads/c1a2b3c4-d5e6-7890-abcd-ef1234567890 -o slice.bin
+```
 
 ---
 
-## Project Structure
+## How It Works
 
-```text
-resumable-stream-engine/
-├── .env.example                    # Environment template (PORT, DB URI, STORAGE_DIR)
-├── package.json                    # ESM project configuration & scripts
-├── docker-compose.yml              # Local PostgreSQL 16 service
-├── README.md                       # Systems architecture & API documentation
-├── CONTEXT.md                      # System context & domain boundary map
-│
-├── docs/adr/                       # Architectural Decision Records
-│   ├── 0001-rfc7233-chunked-resumption.md
-│   ├── 0002-sparse-file-allocation.md
-│   ├── 0003-zero-memory-crypto-hash-streams.md
-│   ├── 0004-posix-offset-writing-concurrency.md
-│   ├── 0005-postgresql-state-management.md
-│   └── 0006-lifecycle-management-abort-signals.md
-│
-├── src/
-│   ├── config/index.js             # Validated configuration & paths
-│   ├── core/                       # Stream Engine Core
-│   │   ├── offset-writer-stream.js # Custom Writable with POSIX pwrite & fdatasync
-│   │   ├── hash-transform-stream.js# Zero-memory incremental SHA-256 Hasher
-│   │   └── pipeline-runner.js      # Stream coordinator with AbortSignal & cleanup
-│   ├── db/                         # Persistence Layer
-│   │   ├── client.js               # PostgreSQL connection pool with transaction runner
-│   │   ├── schema.sql              # DDL schema with check constraints & indexes
-│   │   └── session-repository.js   # Atomic state updates & offset queries
-│   ├── http/                       # Network Protocol Layer (Pure node:http)
-│   │   ├── middlewares/
-│   │   │   ├── range-parser.js     # RFC 7233 Content-Range / Range parser
-│   │   │   └── memory-profiler.js  # Request duration & RSS/Heap telemetry
-│   │   ├── controllers/
-│   │   │   └── upload-controller.js# Request dispatcher binding Core Streams, DB, and HTTP
-│   │   └── server.js               # Native HTTP server bootstrap & router
-│   ├── storage/.gitkeep            # Upload directory placeholder
-│   └── app.js                      # Application bootstrap & graceful shutdown
-│
-├── benchmark/                      # Performance & Chaos Engineering Suite
-│   ├── virtual-stream.js           # Synthetic N-GB stream generator (zero disk pre-fill)
-│   ├── drop-simulator.js           # Mid-stream network abort & resumption simulator
-│   └── run-benchmark.js            # Memory profiler & throughput benchmark
-│
-└── test/                           # Test Suite (node:test)
-    ├── offset-writer.test.js       # Offset writing & backpressure pause/drain tests
-    ├── hash-transform.test.js      # Incremental checksum accuracy tests
-    ├── range-parser.test.js        # RFC 7233 parsing edge cases & validation
-    └── resumable-flow.test.js      # Full upload, interrupt, resume, verify lifecycle
-```
+1. **Sparse file pre-allocation**: When a session is created, the engine opens the file and calls `truncate(totalBytes)`. The filesystem allocates metadata immediately without zero-filling the disk, taking less than 1ms.
+2. **POSIX offset writing (`pwrite`)**: Each chunk is written directly to its target byte offset (`fileHandle.write(chunk, 0, len, offset)`). It doesn't rely on a shared sequential write cursor.
+3. **Stream backpressure**: The incoming HTTP request is piped through a SHA-256 transform stream directly to the disk writer stream. If the disk write buffer fills up, Node pauses reading from the network socket until the buffer drains.
+4. **Crash durability**: When a chunk finishes writing, `fileHandle.sync()` flushes data to disk before the PostgreSQL transaction commits the new `uploaded_bytes` offset. If the server crashes, uncommitted bytes are ignored on reconnect.
 
 ---
 
-## Quickstart
+## Getting Started
 
 ### Prerequisites
-- Node.js 18+ (tested on Node.js 26)
-- Docker & Docker Compose (or PostgreSQL 16+)
 
-### 1. Configure Environment & Start Database
+- Node.js 18+ (uses native ESM and `node:test`)
+- Docker (for PostgreSQL)
+
+### 1. Setup
+
 ```bash
+# Clone and enter directory
+git clone https://github.com/dat-nnguyen/resumable-stream-engine.git
+cd resumable-stream-engine
+
+# Copy environment variables
 cp .env.example .env
-docker-compose up -d
+
+# Start PostgreSQL
+docker compose up -d
+
+# Install dependencies
+npm install
 ```
 
-### 2. Start Service
+### 2. Start the server
+
 ```bash
 npm start
 ```
-The server will start listening at `http://localhost:3000`.
 
-### 3. Run Test Suite
+Server starts on `http://localhost:3000`.
+
+---
+
+## Tests
+
+The test suite uses Node's built-in test runner (`node:test`) with no external test frameworks.
+
 ```bash
 npm test
 ```
 
-### 4. Run Benchmarks & Chaos Simulators
-```bash
-# Measure throughput & prove bounded memory (< 25MB V8 Heap)
-npm run benchmark
+### What the tests cover:
 
-# Run socket drop & resumption chaos simulator
+- `test/range-parser.test.js`: RFC 7233 `Content-Range` and `Range` header parsing (valid ranges, open-ended ranges, suffix ranges, and malformed inputs).
+- `test/hash-transform.test.js`: Streaming SHA-256 calculation, verifying zero memory accumulation and ensuring digests are not appended to the file.
+- `test/offset-writer.test.js`: Writing chunks at specific file offsets, verifying sparse byte padding, and verifying `sync()` execution.
+- `test/resumable-flow.test.js`: Full end-to-end flow with PostgreSQL (upload initialization, chunk uploads, gap detection, retry idempotency, HEAD probe, range downloads, and session abortion).
+
+---
+
+## Benchmarks & Chaos Simulation
+
+### 1. Memory and Throughput Benchmark
+
+Generates and streams 64MB of synthetic data in 8MB chunks using backpressure while sampling V8 Heap and RSS every 25ms:
+
+```bash
+npm run benchmark
+```
+
+**Results:**
+- **Upload Throughput**: ~45–60 MB/s
+- **Download Throughput**: ~300 MB/s
+- **Peak V8 Heap**: ~12–13 MB (demonstrates heap usage does not grow with file size)
+
+### 2. Network Drop Simulator
+
+Simulates real-world network interruption by forcefully destroying the client socket mid-stream:
+
+```bash
 npm run simulate:drop
 ```
+
+**What it does:**
+1. Starts a 12MB upload and completes Chunk 1 (3MB).
+2. Starts Chunk 2 and abruptly aborts the socket after 1MB.
+3. Verifies the server pauses the session and saves the committed 3MB offset.
+4. Probes the server with `HEAD /api/uploads/:id` to retrieve the committed offset.
+5. Resumes uploading remaining chunks from offset 3MB to completion.
+6. Downloads the full file and verifies the SHA-256 hash matches the original byte-for-byte.
 
 ---
 
