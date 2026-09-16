@@ -58,7 +58,7 @@ export async function healthCheck() {
         await pool.query('SELECT NOW()');
         return true;
     } catch (error) {
-        console.error('Database health check failed:', error.message);
+        console.error('Database health check failed:', error);
         return false;
     }
 }

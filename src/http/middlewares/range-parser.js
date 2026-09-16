@@ -2,9 +2,9 @@
 import config from "../../config/index.js";
 
 export function parseContentRange(value, fileSize) {
-    if (!value) return null;
+    if (!value || typeof value !== 'string') return null;
 
-    // Content-Range: bytes 0-499 / 12345
+    // Content-Range: bytes 0-499/12345
     const match = value.match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i);
     if (!match) return null;
 
@@ -19,8 +19,12 @@ export function parseContentRange(value, fileSize) {
     const length = end - start + 1;
 
     if (start < 0 || length <= 0) return null;
-    if (total !== null && start + length > total) return null;
-    if (total !== null && fileSize !== null && end >= fileSize) return null;
+    if (fileSize != null) {
+        if (total === null || total !== fileSize) return null;
+        if (end >= fileSize) return null;
+    } else if (total !== null && end >= total) {
+        return null;
+    }
 
     return {
         start,
@@ -31,21 +35,40 @@ export function parseContentRange(value, fileSize) {
 }
 
 export function parseDownloadRange(headerValue, totalFileSize) {
-    if (!headerValue || typeof headerValue !== 'string') return null;
+    if (!headerValue || typeof headerValue !== 'string' || !totalFileSize || totalFileSize <= 0) return null;
 
-    const match = headerValue.match(/^bytes=(\d+)-(\d*)$/i);
-    if (!match) return null;
+    // Suffix range: bytes=-500 (last 500 bytes)
+    const suffixMatch = headerValue.match(/^bytes=-(\d+)$/i);
+    if (suffixMatch) {
+        const suffixLength = Number(suffixMatch[1]);
+        if (Number.isNaN(suffixLength) || suffixLength <= 0) return null;
+        const length = Math.min(suffixLength, totalFileSize);
+        const start = Math.max(0, totalFileSize - length);
+        const end = totalFileSize - 1;
+        return {
+            start,
+            end,
+            length: end - start + 1,
+            total: totalFileSize,
+        };
+    }
 
-    const start = Number(match[1]);
-    const endStr = match[2];
+    // Standard or open-ended range: bytes=0-499 or bytes=500-
+    const standardMatch = headerValue.match(/^bytes=(\d+)-(\d*)$/i);
+    if (!standardMatch) return null;
 
-    if (Number.isNaN(start) || start < 0) return null;
+    const start = Number(standardMatch[1]);
+    const endStr = standardMatch[2];
 
-    // If end is omitted (e.g. "bytes=1000-"), end defaults to totalFileSize - 1
-    const end = (endStr && endStr.length > 0) ? Number(endStr) : (totalFileSize - 1);
+    if (Number.isNaN(start) || start < 0 || start >= totalFileSize) return null;
 
+    let end = (endStr && endStr.length > 0) ? Number(endStr) : (totalFileSize - 1);
     if (Number.isNaN(end) || end < start) return null;
-    if (totalFileSize !== null && (start >= totalFileSize || end >= totalFileSize)) return null;
+
+    // RFC 7233: If end is >= totalFileSize, clamp to totalFileSize - 1
+    if (end >= totalFileSize) {
+        end = totalFileSize - 1;
+    }
 
     const length = end - start + 1;
 
@@ -56,7 +79,6 @@ export function parseDownloadRange(headerValue, totalFileSize) {
         total: totalFileSize,
     };
 }
-
 
 export function createContentRangeHeader(range, totalFileSize) {
     if (!range || totalFileSize === null) return null;

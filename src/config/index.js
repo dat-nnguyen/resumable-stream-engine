@@ -14,7 +14,7 @@ try {
 }
 
 const STORAGE_DIR = path.resolve(process.cwd(), process.env.STORAGE_DIR || "./src/storage");
-const databaseUrl = process.env.DATABASE_URL || 'postgresql://postgres@localhost:5432/resumable-stream-engine';
+const databaseUrl = process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/stream_engine';
 if (!fs.existsSync(STORAGE_DIR)) {
     fs.mkdirSync(STORAGE_DIR, { recursive: true });
 }
