@@ -10,6 +10,7 @@ import { closePool, healthCheck } from '../src/db/client.js';
 describe('Resumable Streaming Flow End-to-End Integration', () => {
     let server;
     let baseUrl;
+    const createdSessionIds = new Set();
 
     before(async () => {
         const isHealthy = await healthCheck();
@@ -27,11 +28,8 @@ describe('Resumable Streaming Flow End-to-End Integration', () => {
         }
         await closePool();
         // Clean up test storage files
-        const files = await fs.readdir(config.storage.storageDir).catch(() => []);
-        for (const file of files) {
-            if (file.endsWith('.bin')) {
-                await fs.unlink(path.join(config.storage.storageDir, file)).catch(() => {});
-            }
+        for (const id of createdSessionIds) {
+            await fs.unlink(path.join(config.storage.storageDir, `${id}.bin`)).catch(() => {});
         }
     });
 
@@ -62,6 +60,7 @@ describe('Resumable Streaming Flow End-to-End Integration', () => {
         assert.strictEqual(session.uploadedBytes, 0);
         assert.strictEqual(session.status, 'INITIALIZED');
         const sessionId = session.id;
+        createdSessionIds.add(sessionId);
 
         // Verify sparse file allocation on disk
         const filePath = path.join(config.storage.storageDir, `${sessionId}.bin`);
@@ -206,6 +205,7 @@ describe('Resumable Streaming Flow End-to-End Integration', () => {
             body: JSON.stringify({ filename: 'aborted-upload.bin', totalBytes: 5000 }),
         });
         const { id: sessionId } = await initRes.json();
+        createdSessionIds.add(sessionId);
         const filePath = path.join(config.storage.storageDir, `${sessionId}.bin`);
 
         // Verify file exists

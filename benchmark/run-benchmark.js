@@ -37,6 +37,7 @@ async function runBenchmark() {
         if (mem.heapUsed > peakHeap) peakHeap = mem.heapUsed;
     }, 25);
 
+    let sessionId = null;
     try {
         const BENCHMARK_SIZE_MB = 64; // 64MB streaming benchmark
         const TOTAL_BYTES = BENCHMARK_SIZE_MB * 1024 * 1024;
@@ -58,7 +59,7 @@ async function runBenchmark() {
             body: JSON.stringify({ filename: 'benchmark-test.bin', totalBytes: TOTAL_BYTES }),
         });
         const session = await initRes.json();
-        const sessionId = session.id;
+        sessionId = session.id;
         const initDuration = performance.now() - initStart;
         console.log(`✓ Session Created: ${sessionId} (sparse truncate: ${initDuration.toFixed(2)}ms)`);
 
@@ -161,12 +162,8 @@ async function runBenchmark() {
         clearInterval(memorySampler);
         server.close();
         await closePool();
-        // Clean up test file
-        const files = await fs.readdir(config.storage.storageDir).catch(() => []);
-        for (const file of files) {
-            if (file.endsWith('.bin')) {
-                await fs.unlink(path.join(config.storage.storageDir, file)).catch(() => {});
-            }
+        if (sessionId) {
+            await fs.unlink(path.join(config.storage.storageDir, `${sessionId}.bin`)).catch(() => {});
         }
     }
 }

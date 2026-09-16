@@ -27,6 +27,7 @@ async function runDropSimulation() {
     const baseUrl = `http://localhost:${port}`;
     console.log(`✓ Test HTTP server initialized on port ${port}`);
 
+    let sessionId = null;
     try {
         // 1. Prepare 12MB test payload
         const TOTAL_SIZE = 12 * 1024 * 1024; // 12MB
@@ -48,7 +49,7 @@ async function runDropSimulation() {
             body: JSON.stringify({ filename: 'chaos-resilient-dataset.bin', totalBytes: TOTAL_SIZE }),
         });
         const session = await initRes.json();
-        const sessionId = session.id;
+        sessionId = session.id;
         console.log(`✓ Upload session created: ${sessionId}`);
 
         // 3. Upload Chunk 1 (0 to 3MB) cleanly
@@ -160,12 +161,8 @@ async function runDropSimulation() {
     } finally {
         server.close();
         await closePool();
-        // Clean up test file
-        const files = await fs.readdir(config.storage.storageDir).catch(() => []);
-        for (const file of files) {
-            if (file.endsWith('.bin')) {
-                await fs.unlink(path.join(config.storage.storageDir, file)).catch(() => {});
-            }
+        if (sessionId) {
+            await fs.unlink(path.join(config.storage.storageDir, `${sessionId}.bin`)).catch(() => {});
         }
     }
 }
